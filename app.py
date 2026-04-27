@@ -23,11 +23,50 @@ ZOTERO_DIR = os.path.expanduser(
 )
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# Load Kokoro model once at startup
-kokoro = Kokoro(
-    os.path.join(MODELS_DIR, "kokoro-v1.0.onnx"),
-    os.path.join(MODELS_DIR, "voices-v1.0.bin"),
-)
+# ---------------------------------------------------------------------------
+# Model Management
+# ---------------------------------------------------------------------------
+
+def _ensure_models():
+    """Download Kokoro model and voices from Hugging Face if missing."""
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    files = {
+        "kokoro-v1.0.onnx": "https://huggingface.co/hexgrad/Kokoro-82M/resolve/main/kokoro-v1.0.onnx",
+        "voices-v1.0.bin": "https://huggingface.co/hexgrad/Kokoro-82M/resolve/main/voices-v1.0.bin"
+    }
+    
+    for filename, url in files.items():
+        path = os.path.join(MODELS_DIR, filename)
+        if not os.path.exists(path):
+            print(f"--- Downloading {filename} from Hugging Face...")
+            try:
+                with http_requests.get(url, stream=True, timeout=300) as r:
+                    r.raise_for_status()
+                    with open(path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                print(f"--- Successfully downloaded {filename}")
+            except Exception as e:
+                print(f"--- Error downloading {filename}: {e}")
+                if os.path.exists(path):
+                    os.unlink(path)
+
+# Download if needed
+_ensure_models()
+
+# Load Kokoro model if available
+kokoro = None
+model_path = os.path.join(MODELS_DIR, "kokoro-v1.0.onnx")
+voices_path = os.path.join(MODELS_DIR, "voices-v1.0.bin")
+
+if os.path.exists(model_path) and os.path.exists(voices_path):
+    try:
+        kokoro = Kokoro(model_path, voices_path)
+        print("--- Kokoro TTS initialized successfully")
+    except Exception as e:
+        print(f"--- Failed to initialize Kokoro: {e}")
+else:
+    print("--- Kokoro models not found. TTS conversion will be disabled (Playback only mode)")
 
 # Kokoro voice catalog
 KOKORO_VOICES = {
@@ -166,6 +205,119 @@ def delete_track(track_id):
     return jsonify({"ok": True})
 
 
+# ---------------------------------------------------------------------------
+# Batch processing
+# ---------------------------------------------------------------------------
+
+batch_state = {
+    "running": False,
+    "total": 0,
+    "done": 0,
+    "current": None,
+    "errors": [],
+    "completed": [],
+}
+
+
+@app.route("/api/batch", methods=["POST"])
+def batch_start():
+    if batch_state["running"]:
+        return jsonify({"error": "Batch already running"}), 409
+
+    data = request.json or {}
+    voice = data.get("voice", "af_heart")
+
+    # Get all zotero papers, deduplicate by filename
+    if not os.path.isdir(ZOTERO_DIR):
+        return jsonify({"error": "Zotero directory not found"}), 404
+
+    papers = []
+    seen_names = set()
+    for folder in os.listdir(ZOTERO_DIR):
+        folder_path = os.path.join(ZOTERO_DIR, folder)
+        if not os.path.isdir(folder_path):
+            continue
+        for fname in os.listdir(folder_path):
+            if fname.lower().endswith(".pdf"):
+                # Deduplicate by filename
+                if fname in seen_names:
+                    continue
+                seen_names.add(fname)
+                papers.append(os.path.join(folder_path, fname))
+
+    # Skip papers already converted
+    existing_sources = set()
+    for f in os.listdir(AUDIO_DIR):
+        if f.endswith(".json"):
+            with open(os.path.join(AUDIO_DIR, f)) as fh:
+                meta = json.load(fh)
+                existing_sources.add(meta.get("source", ""))
+
+    papers = [p for p in papers if p not in existing_sources]
+    papers.sort()
+
+    if not papers:
+        return jsonify({"error": "All papers already converted"}), 200
+
+    batch_state["running"] = True
+    batch_state["total"] = len(papers)
+    batch_state["done"] = 0
+    batch_state["current"] = None
+    batch_state["errors"] = []
+    batch_state["completed"] = []
+
+    thread = threading.Thread(
+        target=_run_batch, args=(papers, voice), daemon=True
+    )
+    thread.start()
+
+    return jsonify({"started": True, "total": len(papers)})
+
+
+@app.route("/api/batch/status")
+def batch_status():
+    return jsonify(batch_state)
+
+
+@app.route("/api/batch/stop", methods=["POST"])
+def batch_stop():
+    batch_state["running"] = False
+    return jsonify({"ok": True})
+
+
+def _run_batch(papers, voice):
+    for i, pdf_path in enumerate(papers):
+        if not batch_state["running"]:
+            break
+
+        name = os.path.basename(pdf_path).replace(".pdf", "")
+        batch_state["current"] = name
+        batch_state["done"] = i
+
+        job_id = uuid.uuid4().hex[:8]
+        jobs[job_id] = {
+            "id": job_id,
+            "status": "reading",
+            "progress": 0,
+            "error": None,
+        }
+
+        try:
+            _process_conversion(job_id, None, voice, local_path=pdf_path)
+            if jobs[job_id]["status"] == "error":
+                batch_state["errors"].append(
+                    {"name": name, "error": jobs[job_id]["error"]}
+                )
+            else:
+                batch_state["completed"].append(name)
+        except Exception as e:
+            batch_state["errors"].append({"name": name, "error": str(e)})
+
+    batch_state["done"] = batch_state["total"] if batch_state["running"] else i
+    batch_state["running"] = False
+    batch_state["current"] = None
+
+
 @app.route("/api/voices")
 def voices():
     voice_list = []
@@ -187,6 +339,9 @@ def _synthesize_kokoro(text, voice, job_id):
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not paragraphs:
         paragraphs = [text]
+
+    if not kokoro:
+        raise RuntimeError("Kokoro engine is not initialized. Models may be missing.")
 
     chunks = []
     total = len(paragraphs)
