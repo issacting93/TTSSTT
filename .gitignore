@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+ENV/
+audio/
+models/
+*.wav
+server.log
+.DS_Store
+.claude/
